@@ -1,274 +1,212 @@
 #!/usr/bin/env python3
-"""
-Prototype 1: Real-time 2-mic sound localization using GCC-PHAT TDOA.
+"""Real-time 2-mic sound localization using GCC-PHAT TDOA.
 
-Algorithm: Generalized Cross-Correlation with Phase Transform
-- Estimates time difference of arrival (TDOA) between two microphones
-- Converts to azimuth angle and 1D position along mic axis
-- Lowest CPU cost, most transparent failure modes
+Lowest-CPU, lowest-latency approach. Estimates time difference of arrival
+using phase-weighted cross-correlation, converts to 1D position.
+
+Best for embedded systems, fast response, relatively clean rooms.
 
 Usage:
+    # List devices
     python 1_tdoa_gcc_phat.py --list-devices
+    
+    # Stream from Scarlett (device 3), channels 0-1, mics 4m apart
     python 1_tdoa_gcc_phat.py --device 3 --in-channels 8 --mic1 0 --mic2 1 --mic-distance 4.0
+    
+    # With different parameters
+    python 1_tdoa_gcc_phat.py --device 3 --in-channels 8 --mic1 0 --mic2 1 \
+        --window-ms 120 --hop-ms 20 --highpass-hz 1000 --conf-threshold 5.0
 """
 
 import argparse
-import queue
-import sys
-import time
-from dataclasses import dataclass
-
 import numpy as np
 import sounddevice as sd
-from scipy.signal import butter, sosfilt
-
+import sys
+from datetime import datetime
 from _common import (
-    SPEED_OF_SOUND,
-    gcc_phat_tdoa,
-    design_highpass,
-    normalize_signal,
-    RateLimiter,
-    LocalizationResult,
-    tdoa_to_azimuth,
-    tdoa_to_position_1d,
+    gcc_phat, tdoa_to_position, highpass_filter, rms, db,
+    ExponentialMovingAverage, extract_multichannel_chunk
 )
 
 
-@dataclass
-class Config:
-    """Configuration for 2-mic TDOA localization."""
-    device: int
-    samplerate: int
-    in_channels: int
-    mic1: int
-    mic2: int
-    mic_distance_m: float
-    blocksize: int
-    window_ms: float
-    hop_ms: float
-    highpass_hz: float
-    confidence_threshold: float
-    print_hz: float
-    interp: int
-
-
-def list_devices_and_exit():
-    """Print available audio devices and exit."""
-    print(sd.query_devices())
-    print("\nPick the input device index and pass with --device")
-    sys.exit(0)
-
-
 def main():
-    p = argparse.ArgumentParser(
-        description="Real-time 2-microphone sound localization via GCC-PHAT TDOA."
+    parser = argparse.ArgumentParser(
+        description="Real-time 2-mic sound localization with GCC-PHAT TDOA"
     )
-    p.add_argument(
-        "--list-devices", action="store_true", help="List audio devices and exit."
+    parser.add_argument(
+        '--device', type=int, default=None,
+        help='Audio device index (or auto-detect)'
     )
-    p.add_argument(
-        "--device", type=int, default=None, help="Input device index."
+    parser.add_argument(
+        '--list-devices', action='store_true',
+        help='List available audio devices and exit'
     )
-    p.add_argument(
-        "--samplerate", type=int, default=48000, help="Sample rate in Hz."
+    parser.add_argument(
+        '--in-channels', type=int, default=2,
+        help='Number of input channels'
     )
-    p.add_argument(
-        "--in-channels",
-        type=int,
-        default=None,
-        help="Number of input channels to open (e.g., 8 for Scarlett).",
+    parser.add_argument(
+        '--mic1', type=int, default=0,
+        help='Channel index for microphone 1'
     )
-    p.add_argument(
-        "--mic1", type=int, default=0, help="Index of microphone 1 (0-based)."
+    parser.add_argument(
+        '--mic2', type=int, default=1,
+        help='Channel index for microphone 2'
     )
-    p.add_argument(
-        "--mic2", type=int, default=1, help="Index of microphone 2 (0-based)."
+    parser.add_argument(
+        '--mic-distance', type=float, default=1.0,
+        help='Distance between mics in meters'
     )
-    p.add_argument(
-        "--mic-distance", type=float, default=4.0, help="Distance between mics in meters."
+    parser.add_argument(
+        '--sample-rate', type=int, default=16000,
+        help='Sample rate in Hz'
     )
-    p.add_argument(
-        "--blocksize", type=int, default=1024, help="Audio callback block size in frames."
+    parser.add_argument(
+        '--window-ms', type=float, default=80,
+        help='Window length in milliseconds (longer = smoother but more latency)'
     )
-    p.add_argument(
-        "--window-ms", type=float, default=80.0, help="Analysis window length in ms."
+    parser.add_argument(
+        '--hop-ms', type=float, default=20,
+        help='Hop length in milliseconds (shorter = more frequent updates)'
     )
-    p.add_argument(
-        "--hop-ms", type=float, default=20.0, help="Hop interval in ms."
+    parser.add_argument(
+        '--highpass-hz', type=float, default=500,
+        help='Highpass filter cutoff in Hz (0 = no filter)'
     )
-    p.add_argument(
-        "--highpass-hz", type=float, default=120.0, help="High-pass cutoff (0 to disable)."
+    parser.add_argument(
+        '--conf-threshold', type=float, default=3.0,
+        help='Confidence threshold for valid detections'
     )
-    p.add_argument(
-        "--conf-threshold", type=float, default=3.0, help="Confidence threshold."
+    parser.add_argument(
+        '--interp', type=int, default=4,
+        help='Interpolation factor for TDOA estimation (higher = finer)'
     )
-    p.add_argument(
-        "--print-hz", type=float, default=10.0, help="Max output rate (Hz)."
+    parser.add_argument(
+        '--print-hz', type=float, default=10,
+        help='Print updates per second (0 = every frame)'
     )
-    p.add_argument(
-        "--interp", type=int, default=4, help="GCC-PHAT interpolation factor."
+    parser.add_argument(
+        '--smooth', type=float, default=0.3,
+        help='EMA alpha for position smoothing (0 = no smoothing)'
     )
-    args = p.parse_args()
-
+    
+    args = parser.parse_args()
+    
+    # List devices
     if args.list_devices:
-        list_devices_and_exit()
-
-    # Resolve device
-    if args.device is None:
-        args.device = (
-            sd.default.device[0]
-            if isinstance(sd.default.device, (list, tuple))
-            else sd.default.device
-        )
-        if args.device is None:
-            raise SystemExit(
-                "No default input device. Use --list-devices and pass --device."
-            )
-
-    # Check channel indices
-    devinfo = sd.query_devices(args.device, kind="input")
-    max_in = int(devinfo["max_input_channels"])
-
-    if args.in_channels is None:
-        args.in_channels = max(args.mic1, args.mic2) + 1
-
-    if args.in_channels > max_in:
-        raise SystemExit(
-            f"Device only has {max_in} input channels, but --in-channels {args.in_channels} requested."
-        )
-    if not (0 <= args.mic1 < args.in_channels and 0 <= args.mic2 < args.in_channels):
-        raise SystemExit(
-            f"Mic indices must be within [0, {args.in_channels - 1}]."
-        )
-
-    cfg = Config(
-        device=args.device,
-        samplerate=args.samplerate,
-        in_channels=args.in_channels,
-        mic1=args.mic1,
-        mic2=args.mic2,
-        mic_distance_m=args.mic_distance,
-        blocksize=args.blocksize,
-        window_ms=args.window_ms,
-        hop_ms=args.hop_ms,
-        highpass_hz=args.highpass_hz,
-        confidence_threshold=args.conf_threshold,
-        print_hz=args.print_hz,
-        interp=args.interp,
-    )
-
-    print(f"2-mic TDOA localizer")
-    print(f"  Device: {args.device} ({devinfo['name']})")
-    print(f"  Sample rate: {cfg.samplerate} Hz")
-    print(f"  Opening {cfg.in_channels} input channels using mic1={cfg.mic1}, mic2={cfg.mic2}")
-    print(f"  Mic distance: {cfg.mic_distance_m:.3f} m")
-    print(
-        f"  Analysis window: {cfg.window_ms:.1f} ms, hop: {cfg.hop_ms:.1f} ms, blocksize: {cfg.blocksize}"
-    )
-    print(f"  High-pass: {cfg.highpass_hz:.1f} Hz, GCC interp: {cfg.interp}x")
-    print(f"  Confidence threshold: {cfg.confidence_threshold:.2f}")
-    print("Press Ctrl+C to stop.\n")
-
-    q = queue.Queue(maxsize=200)
-
-    # DSP setup
-    hp_sos = design_highpass(cfg.samplerate, cfg.highpass_hz, order=4)
-
-    window_len = int(round(cfg.window_ms * 1e-3 * cfg.samplerate))
-    hop_len = int(round(cfg.hop_ms * 1e-3 * cfg.samplerate))
-    hop_len = max(1, hop_len)
-    window_len = max(window_len, cfg.blocksize)
-
-    max_tau = cfg.mic_distance_m / SPEED_OF_SOUND
-
-    # Buffers
-    buf1 = np.zeros(window_len, dtype=np.float32)
-    buf2 = np.zeros(window_len, dtype=np.float32)
-    pending = np.zeros((0, 2), dtype=np.float32)
-
-    rate_limiter = RateLimiter(cfg.print_hz)
-
-    def callback(indata, frames, timeinfo, status):
-        if status:
-            pass  # Could log status
-        try:
-            q.put_nowait(indata.copy())
-        except queue.Full:
-            pass
-
-    with sd.InputStream(
-        device=cfg.device,
-        channels=cfg.in_channels,
-        samplerate=cfg.samplerate,
-        blocksize=cfg.blocksize,
-        dtype="float32",
-        callback=callback,
-    ):
-        print("Streaming...\n")
-        try:
+        print("\nAvailable audio devices:")
+        print(sd.query_devices())
+        sys.exit(0)
+    
+    # Setup
+    sr = args.sample_rate
+    window_samples = int(sr * args.window_ms / 1000)
+    hop_samples = int(sr * args.hop_ms / 1000)
+    
+    print(f"\n{'='*80}")
+    print(f"GCC-PHAT TDOA 2-Mic Localizer")
+    print(f"{'='*80}")
+    print(f"Sample rate:        {sr} Hz")
+    print(f"Window:             {args.window_ms} ms ({window_samples} samples)")
+    print(f"Hop:                {args.hop_ms} ms ({hop_samples} samples)")
+    print(f"Highpass:           {args.highpass_hz} Hz")
+    print(f"Confidence thresh:  {args.conf_threshold}")
+    print(f"Mic distance:       {args.mic_distance} m")
+    print(f"Mic 1 / Mic 2:      ch{args.mic1} / ch{args.mic2}")
+    print(f"TDOA interp:        {args.interp}x")
+    print(f"Position smoothing: alpha={args.smooth}")
+    print(f"\nStarting stream (device={args.device})...\n")
+    print(f"{'Time':<12} {'TDOA (ms)':<12} {'Pos (m)':<12} {'Conf':<10} {'RMS (dB)':<10}")
+    print(f"{'-'*80}")
+    
+    # Smoothers
+    pos_smoother = ExponentialMovingAverage(alpha=args.smooth)
+    
+    # Open stream
+    try:
+        with sd.InputStream(
+            device=args.device,
+            samplerate=sr,
+            channels=args.in_channels,
+            blocksize=hop_samples,
+            latency='low',
+            dtype='float32'
+        ) as stream:
+            
+            # Accumulate window
+            buffer = np.zeros(window_samples + hop_samples, dtype='float32')
+            frame_count = 0
+            last_print_frame = 0
+            
             while True:
-                block = q.get()
-                if block.ndim != 2 or block.shape[1] != cfg.in_channels:
+                # Read next hop
+                try:
+                    chunk = stream.read(hop_samples, allow_overflow=True)
+                except Exception as e:
+                    print(f"Stream error: {e}", file=sys.stderr)
                     continue
-
-                # Extract the two channels of interest
-                x1 = block[:, cfg.mic1].astype(np.float32, copy=False)
-                x2 = block[:, cfg.mic2].astype(np.float32, copy=False)
-
-                # Accumulate to hop length
-                pair = np.stack([x1, x2], axis=1)
-                pending = np.concatenate([pending, pair], axis=0)
-
-                # Process hop
-                while pending.shape[0] >= hop_len:
-                    chunk = pending[:hop_len]
-                    pending = pending[hop_len:]
-
-                    # Slide window buffers
-                    n = chunk.shape[0]
-                    buf1 = np.roll(buf1, -n)
-                    buf2 = np.roll(buf2, -n)
-                    buf1[-n:] = chunk[:, 0]
-                    buf2[-n:] = chunk[:, 1]
-
-                    # Process window
-                    x1w = buf1.copy()
-                    x2w = buf2.copy()
-
-                    # Optional high-pass
-                    if hp_sos is not None:
-                        x1w = sosfilt(hp_sos, x1w)
-                        x2w = sosfilt(hp_sos, x2w)
-
-                    # Normalize
-                    x1w = normalize_signal(x1w)
-                    x2w = normalize_signal(x2w)
-
-                    # GCC-PHAT TDOA
-                    tau_s, shift_samp, conf = gcc_phat_tdoa(
-                        x1w, x2w, fs=cfg.samplerate, max_tau=max_tau, interp=cfg.interp
+                
+                if chunk is None or len(chunk) == 0:
+                    continue
+                
+                # Shift buffer and add new chunk
+                buffer[:-hop_samples] = buffer[hop_samples:]
+                buffer[-hop_samples:] = chunk[:hop_samples, 0]  # Dummy, will be replaced
+                
+                # Extract mic channels
+                chunk_multi = chunk[:, [args.mic1, args.mic2]]
+                buffer_multi = np.vstack([
+                    np.zeros((window_samples - hop_samples, 2)),
+                    chunk_multi
+                ])
+                
+                frame_count += 1
+                
+                # Process every print interval
+                should_print = (frame_count - last_print_frame) >= (sr / args.hop_ms / args.print_hz) if args.print_hz > 0 else True
+                
+                if should_print or True:  # Always process
+                    # Highpass filter
+                    mic1_filtered = highpass_filter(buffer_multi[:, 0], args.highpass_hz, sr)
+                    mic2_filtered = highpass_filter(buffer_multi[:, 1], args.highpass_hz, sr)
+                    
+                    # TDOA estimation
+                    tdoa_sec, confidence = gcc_phat(
+                        mic1_filtered, mic2_filtered, sr, interp=args.interp
                     )
-
-                    if conf < cfg.confidence_threshold:
-                        continue
-
-                    # Convert to azimuth and 1D position
-                    angle_deg = tdoa_to_azimuth(tau_s, cfg.mic_distance_m)
-                    x_m = tdoa_to_position_1d(tau_s, cfg.mic_distance_m)
-
-                    # Direction hint
-                    direction = "toward_mic1" if tau_s > 0 else "toward_mic2" if tau_s < 0 else "center"
-
-                    if rate_limiter.should_print():
+                    
+                    # Convert to position
+                    position_m, sol_type = tdoa_to_position(
+                        tdoa_sec, args.mic_distance, sr
+                    )
+                    
+                    # Smooth
+                    if confidence >= args.conf_threshold:
+                        position_m_smooth = pos_smoother.update(position_m)
+                    else:
+                        position_m_smooth = pos_smoother.value if pos_smoother.value is not None else position_m
+                    
+                    # RMS
+                    rms_mic1 = rms(mic1_filtered)
+                    rms_db = db(rms_mic1, ref=1e-5)
+                    
+                    # Print
+                    if should_print:
+                        time_str = datetime.now().strftime('%H:%M:%S')
+                        tdoa_ms = tdoa_sec * 1000
+                        marker = "*" if confidence >= args.conf_threshold else "-"
                         print(
-                            f"[TDOA] tdoa={tau_s*1e3:7.3f}ms | shift={shift_samp:5d}samp "
-                            f"| angle={angle_deg:6.1f}° | x={x_m:5.2f}m | "
-                            f"conf={conf:5.2f} | {direction}"
+                            f"{time_str:<12} "
+                            f"{tdoa_ms:>10.2f} ms "
+                            f"{position_m:>10.2f} m "
+                            f"{confidence:>8.2f} {marker}  "
+                            f"{rms_db:>8.1f} dB"
                         )
+                        last_print_frame = frame_count
+    
+    except KeyboardInterrupt:
+        print("\n\nShutdown.")
 
-        except KeyboardInterrupt:
-            print()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
